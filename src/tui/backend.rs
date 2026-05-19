@@ -234,6 +234,9 @@ pub struct RemoteConnection {
     line_buffer: String,
     has_loaded_history: bool,
     call_output_tokens_seen: u64,
+    /// Number of consecutive JSON parse failures; reset to 0 on a successful parse.
+    /// Used to skip isolated malformed lines without immediately disconnecting.
+    consecutive_parse_errors: u32,
 }
 
 const DETACHED_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -291,6 +294,7 @@ impl RemoteConnection {
             line_buffer: String::new(),
             has_loaded_history: false,
             call_output_tokens_seen: 0,
+            consecutive_parse_errors: 0,
         };
 
         // Subscribe to events
@@ -905,15 +909,25 @@ impl RemoteConnection {
                         continue;
                     }
                     match serde_json::from_str(&self.line_buffer) {
-                        Ok(event) => return RemoteRead::Event(event),
+                        Ok(event) => {
+                            self.consecutive_parse_errors = 0;
+                            return RemoteRead::Event(event);
+                        }
                         Err(error) => {
+                            self.consecutive_parse_errors += 1;
+                            let preview: String = self.line_buffer.chars().take(120).collect();
                             crate::logging::warn(&format!(
-                                "RemoteConnection::next_event: protocol error={} line={:?} (session_id={:?}, client_instance_id={:?})",
-                                error, self.line_buffer, self.session_id, self.client_instance_id
+                                "RemoteConnection::next_event: parse error #{} ({}) line_preview={:?} (session_id={:?}, client_instance_id={:?})",
+                                self.consecutive_parse_errors, error, preview,
+                                self.session_id, self.client_instance_id
                             ));
-                            return RemoteRead::Disconnected(RemoteDisconnectReason::Protocol(
-                                error.to_string(),
-                            ));
+                            if self.consecutive_parse_errors >= 3 {
+                                return RemoteRead::Disconnected(RemoteDisconnectReason::Protocol(
+                                    error.to_string(),
+                                ));
+                            }
+                            // Skip this malformed line and keep reading.
+                            continue;
                         }
                     }
                 }
@@ -955,6 +969,7 @@ impl RemoteConnection {
             line_buffer: String::new(),
             has_loaded_history: false,
             call_output_tokens_seen: 0,
+            consecutive_parse_errors: 0,
         }
     }
 

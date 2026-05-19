@@ -545,18 +545,13 @@ pub(super) async fn handle_remote_event<B: Backend>(
         RemoteRead::Disconnected(reason) => {
             if let RemoteDisconnectReason::Protocol(error) = &reason {
                 let detail = format_disconnect_reason(&reason);
-                crate::logging::error(&format!(
-                    "Remote protocol error is not retryable; stopping reconnect loop: {}",
+                crate::logging::warn(&format!(
+                    "Remote protocol error (will reconnect): {}",
                     error
                 ));
-                app.push_display_message(DisplayMessage::error(format!(
-                    "Remote protocol error. Stopped reconnecting to avoid replaying a large/corrupt session repeatedly. {}\n\nTry starting a fresh session, or resume after reducing/removing oversized tool output from the session history.",
-                    detail
-                )));
-                app.set_status_notice("Remote protocol error");
-                app.is_processing = false;
-                app.status = ProcessingStatus::Idle;
-                return Ok((RemoteEventOutcome::Quit, true));
+                app.set_status_notice("Remote protocol error — reconnecting…");
+                // Fall through to the normal reconnect path below.
+                let _ = detail;
             }
             handle_disconnect(app, state, Some(reason));
             Ok((RemoteEventOutcome::Reconnect, true))
