@@ -113,3 +113,77 @@ fn test_initialize_result() {
     assert_eq!(result.protocol_version, "2024-11-05");
     assert!(result.server_info.is_some());
 }
+
+#[test]
+fn test_mcp_config_filter_by_names() {
+    use crate::mcp::protocol::{McpConfig, McpServerConfig};
+    use std::collections::HashMap;
+
+    let make_server = |cmd: &str| McpServerConfig {
+        command: cmd.to_string(),
+        args: vec![],
+        env: HashMap::new(),
+        shared: true,
+        disabled: false,
+    };
+
+    let mut config = McpConfig {
+        servers: [
+            ("github".to_string(), make_server("npx")),
+            ("octocode".to_string(), make_server("npx")),
+            ("agentmemory".to_string(), make_server("npx")),
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    config.filter_by_names(&["github".to_string(), "octocode".to_string()]);
+    assert_eq!(config.servers.len(), 2);
+    assert!(config.servers.contains_key("github"));
+    assert!(config.servers.contains_key("octocode"));
+    assert!(!config.servers.contains_key("agentmemory"));
+}
+
+#[test]
+fn test_mcp_config_remove_disabled() {
+    use crate::mcp::protocol::{McpConfig, McpServerConfig};
+    use std::collections::HashMap;
+
+    let make_server = |disabled: bool| McpServerConfig {
+        command: "npx".to_string(),
+        args: vec![],
+        env: HashMap::new(),
+        shared: true,
+        disabled,
+    };
+
+    let mut config = McpConfig {
+        servers: [
+            ("active".to_string(), make_server(false)),
+            ("disabled".to_string(), make_server(true)),
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    config.remove_disabled();
+    assert_eq!(config.servers.len(), 1);
+    assert!(config.servers.contains_key("active"));
+    assert!(!config.servers.contains_key("disabled"));
+}
+
+#[test]
+fn test_mcp_server_config_disabled_default() {
+    let json = r#"{"command": "npx", "args": []}"#;
+    let config: crate::mcp::protocol::McpServerConfig =
+        serde_json::from_str(json).expect("parse failed");
+    assert!(!config.disabled, "disabled should default to false");
+}
+
+#[test]
+fn test_mcp_server_config_disabled_true() {
+    let json = r#"{"command": "npx", "args": [], "disabled": true}"#;
+    let config: crate::mcp::protocol::McpServerConfig =
+        serde_json::from_str(json).expect("parse failed");
+    assert!(config.disabled);
+}

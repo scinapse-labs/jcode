@@ -59,6 +59,13 @@ fn parse_and_prepare_args() -> Result<Args> {
         crate::env::set_var("JCODE_TRACE", "1");
     }
 
+    // --mcp flag sets JCODE_MCP env var, which McpConfig::load() reads as an allowlist
+    if let Some(ref mcp_servers) = args.mcp {
+        let joined = mcp_servers.join(",");
+        crate::env::set_var("JCODE_MCP", &joined);
+        logging::info(&format!("MCP server allowlist: {}", joined));
+    }
+
     if let Some(ref socket) = args.socket {
         server::set_socket_path(socket);
     }

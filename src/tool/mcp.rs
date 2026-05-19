@@ -205,6 +205,7 @@ impl McpManagementTool {
             args: params.args.unwrap_or_default(),
             env: params.env.unwrap_or_default(),
             shared: true,
+            disabled: false,
         };
 
         let manager = self.manager.read().await;

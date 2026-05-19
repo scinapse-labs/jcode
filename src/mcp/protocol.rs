@@ -179,6 +179,10 @@ pub struct McpServerConfig {
     /// Stateful servers (Playwright browser) should not be shared.
     #[serde(default = "default_shared")]
     pub shared: bool,
+    /// Whether this server is disabled (default: false).
+    /// Set to true in mcp.json to prevent a server from being started.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 fn default_shared() -> bool {
@@ -193,6 +197,20 @@ pub struct McpConfig {
 }
 
 impl McpConfig {
+    /// Filter servers to only include those in the given allowlist.
+    /// Names are matched case-insensitively.
+    pub fn filter_by_names(&mut self, names: &[String]) {
+        let lower: std::collections::HashSet<String> =
+            names.iter().map(|n| n.to_lowercase()).collect();
+        self.servers
+            .retain(|name, _| lower.contains(&name.to_lowercase()));
+    }
+
+    /// Remove servers that are marked `disabled: true`.
+    pub fn remove_disabled(&mut self) {
+        self.servers.retain(|_, cfg| !cfg.disabled);
+    }
+
     /// Load config from file
     pub fn load_from_file(path: &std::path::Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
@@ -316,6 +334,7 @@ impl McpConfig {
                             args,
                             env,
                             shared,
+                            disabled: false,
                         },
                     );
                 }
@@ -358,6 +377,21 @@ impl McpConfig {
         if local_claude.exists() {
             if let Ok(config) = Self::load_from_file(local_claude) {
                 merged.servers.extend(config.servers);
+            }
+        }
+
+        // Remove disabled servers
+        merged.remove_disabled();
+
+        // Apply CLI/env allowlist: JCODE_MCP=server1,server2 enables only those servers
+        if let Ok(val) = std::env::var("JCODE_MCP") {
+            let names: Vec<String> = val
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !names.is_empty() {
+                merged.filter_by_names(&names);
             }
         }
 

@@ -84,6 +84,12 @@ pub(crate) struct Args {
     #[arg(long, global = true)]
     pub(crate) provider_profile: Option<String>,
 
+    /// Comma-separated list of MCP server names to enable (others are disabled).
+    /// Example: --mcp github,octocode
+    /// Overrides the JCODE_MCP environment variable if both are set.
+    #[arg(long, global = true, value_delimiter = ',')]
+    pub(crate) mcp: Option<Vec<String>>,
+
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
 }
