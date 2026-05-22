@@ -1,8 +1,12 @@
 mod animation;
+mod desktop_benchmark;
 mod desktop_config;
+mod desktop_gallery;
 mod desktop_log;
 mod desktop_prefs;
+mod desktop_rich_text;
 mod desktop_session_events;
+mod desktop_ui_engine;
 mod power_inhibit;
 mod render_helpers;
 mod session_data;
@@ -16,6 +20,7 @@ use animation::{AnimatedViewport, FocusPulse, VisibleColumnLayout, WorkspaceRend
 use anyhow::{Context, Result};
 use base64::Engine;
 use bytemuck::{Pod, Zeroable};
+use desktop_benchmark::*;
 use desktop_config::*;
 use desktop_session_events::{
     BACKEND_EVENT_FORWARD_INTERVAL, BACKEND_EVENT_FORWARD_MAX_PAYLOAD_BYTES,
@@ -38,7 +43,7 @@ use single_session::{
 };
 use single_session_render::*;
 use wgpu::{CompositeAlphaMode, PresentMode, SurfaceError, TextureUsages};
-use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Event, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -48,7 +53,7 @@ use workspace::{InputMode, KeyInput, KeyOutcome, PanelSizePreset, Workspace};
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsString;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -60,6 +65,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_WINDOW_WIDTH: f64 = 1280.0;
 const DEFAULT_WINDOW_HEIGHT: f64 = 800.0;
+const DESKTOP_RELOAD_WINDOW_ENV: &str = "JCODE_DESKTOP_RELOAD_WINDOW";
+const DESKTOP_RELOAD_HANDOFF_READY_ENV: &str = "JCODE_DESKTOP_RELOAD_READY_FILE";
+const DESKTOP_RELOAD_HANDOFF_RELEASE_ENV: &str = "JCODE_DESKTOP_RELOAD_RELEASE_FILE";
+const DESKTOP_RELOAD_HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const DESKTOP_RELOAD_HANDOFF_TIMEOUT: Duration = Duration::from_secs(8);
+const DESKTOP_RELOAD_STARTUP_RELEASE_TIMEOUT: Duration = Duration::from_secs(3);
+const DESKTOP_RELOAD_MAX_RESTORED_DIMENSION: u32 = 32_768;
 const OUTER_PADDING: f32 = 8.0;
 const GAP: f32 = 6.0;
 const STATUS_BAR_HEIGHT: f32 = 30.0;
@@ -114,8 +126,9 @@ const SINGLE_SESSION_BODY_TEXT_WINDOW_BEFORE_LINES: usize = 48;
 const SINGLE_SESSION_BODY_TEXT_WINDOW_AFTER_LINES: usize = 96;
 const SINGLE_SESSION_STREAMING_BODY_TEXT_WINDOW_BEFORE_LINES: usize = 2;
 const SINGLE_SESSION_STREAMING_BODY_TEXT_WINDOW_AFTER_LINES: usize = 4;
-const STREAMING_TEXT_FADE_DURATION: Duration = Duration::from_millis(120);
+const STREAMING_TEXT_FADE_DURATION: Duration = Duration::from_millis(150);
 const STREAMING_TEXT_FADE_START_OPACITY: f32 = 0.4;
+const STREAMING_TEXT_RISE_START_OFFSET_PIXELS: f32 = 3.5;
 const DESKTOP_ASYNC_JOB_LIMIT: usize = 12;
 const PRIMITIVE_VERTEX_BUFFER_MIN_CAPACITY: usize = 1024;
 const PRIMITIVE_VERTEX_BUFFER_SHRINK_RATIO: usize = 4;
@@ -209,17 +222,57 @@ fn desktop_background_wake(
     }
 }
 
-fn streaming_text_fade_opacity_for_elapsed(elapsed: Duration) -> (f32, bool) {
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StreamingTextArrivalStyle {
+    opacity: f32,
+    y_offset_pixels: f32,
+    active: bool,
+}
+
+fn streaming_text_arrival_style_for_elapsed(elapsed: Duration) -> StreamingTextArrivalStyle {
     let progress =
         (elapsed.as_secs_f32() / STREAMING_TEXT_FADE_DURATION.as_secs_f32()).clamp(0.0, 1.0);
     if progress >= 1.0 {
-        return (1.0, false);
+        return StreamingTextArrivalStyle {
+            opacity: 1.0,
+            y_offset_pixels: 0.0,
+            active: false,
+        };
     }
     let eased = animation::ease_out_cubic(progress);
-    (
-        STREAMING_TEXT_FADE_START_OPACITY + (1.0 - STREAMING_TEXT_FADE_START_OPACITY) * eased,
-        true,
-    )
+    StreamingTextArrivalStyle {
+        opacity: STREAMING_TEXT_FADE_START_OPACITY
+            + (1.0 - STREAMING_TEXT_FADE_START_OPACITY) * eased,
+        y_offset_pixels: STREAMING_TEXT_RISE_START_OFFSET_PIXELS * (1.0 - eased),
+        active: true,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn streaming_text_fade_opacity_for_elapsed(elapsed: Duration) -> (f32, bool) {
+    let style = streaming_text_arrival_style_for_elapsed(elapsed);
+    (style.opacity, style.active)
+}
+
+fn streaming_text_fade_start_after_len_change(
+    previous_len: usize,
+    next_len: usize,
+    current_started_at: Option<Instant>,
+    now: Instant,
+) -> Option<Instant> {
+    if next_len == 0 {
+        return None;
+    }
+
+    let response_changed = previous_len != next_len;
+    let fade_active = current_started_at.is_some_and(|started_at| {
+        now.saturating_duration_since(started_at) < STREAMING_TEXT_FADE_DURATION
+    });
+    if response_changed && !fade_active {
+        Some(now)
+    } else {
+        current_started_at
+    }
 }
 const DESKTOP_120FPS_FRAME_BUDGET: Duration = Duration::from_micros(8_333);
 const DESKTOP_PRESENT_STALL_BUDGET: Duration = Duration::from_millis(33);
@@ -405,6 +458,9 @@ async fn run() -> Result<()> {
     if let Some(message) = headless_chat_smoke_message(&args) {
         return run_headless_chat_smoke(message);
     }
+    if let Some(frames) = resize_render_benchmark_frames(&args) {
+        return run_resize_render_benchmark(frames);
+    }
     if let Some(frames) = scroll_render_benchmark_frames(&args) {
         return run_scroll_render_benchmark(frames);
     }
@@ -414,9 +470,15 @@ async fn run() -> Result<()> {
     if let Some(raw_events) = stream_e2e_benchmark_raw_events(&args) {
         return run_stream_e2e_benchmark(raw_events);
     }
+    if desktop_gallery::launcher_requested(&args) {
+        return desktop_gallery::launch_temporary_windows();
+    }
     let fullscreen = args.iter().any(|arg| arg == "--fullscreen");
+    let desktop_gallery_state = desktop_gallery::state_from_args(&args);
+    let desktop_gallery = desktop_gallery_state.is_some();
     let desktop_mode = desktop_mode_from_args(args.iter().map(String::as_str));
     let resume_session_id = desktop_resume_session_id_from_args(args.iter().map(String::as_str));
+    let desktop_reload_startup = DesktopReloadStartup::from_env();
     emit_desktop_profile_event(
         "jcode-desktop-launch-profile",
         serde_json::json!({
@@ -431,12 +493,19 @@ async fn run() -> Result<()> {
         .context("failed to create event loop")?;
     let event_loop_proxy = event_loop.create_proxy();
     startup_trace.mark("event loop created");
-    let mut window_builder = WindowBuilder::new()
-        .with_title("Jcode Desktop")
-        .with_inner_size(LogicalSize::new(
+    let mut window_builder = WindowBuilder::new().with_title("Jcode Desktop");
+    if let Some(placement) = desktop_reload_startup.window_placement {
+        window_builder = placement.apply_to_window_builder(window_builder);
+    } else {
+        window_builder = window_builder.with_inner_size(LogicalSize::new(
             DEFAULT_WINDOW_WIDTH,
             DEFAULT_WINDOW_HEIGHT,
         ));
+    }
+
+    if desktop_reload_startup.hidden_until_handoff_release() {
+        window_builder = window_builder.with_visible(false);
+    }
 
     if fullscreen {
         window_builder = window_builder.with_fullscreen(Some(Fullscreen::Borderless(None)));
@@ -451,7 +520,9 @@ async fn run() -> Result<()> {
 
     let mut pending_workspace_startup_load = false;
     let mut pending_workspace_startup_preferences = None;
-    let mut app = if desktop_mode == DesktopMode::WorkspacePrototype {
+    let mut app = if let Some(gallery_state) = desktop_gallery_state.as_deref() {
+        desktop_gallery::temporary_app(gallery_state)
+    } else if desktop_mode == DesktopMode::WorkspacePrototype {
         let mut workspace = Workspace::loading_sessions();
         if let Some(preferences) = load_desktop_preferences() {
             workspace.apply_preferences(preferences.clone());
@@ -466,6 +537,12 @@ async fn run() -> Result<()> {
     window.set_title(&app.status_title());
     let mut canvas = Canvas::new(window.clone(), startup_trace).await?;
     startup_trace.mark("canvas ready");
+    if let Some(handoff) = desktop_reload_startup.handoff.as_ref() {
+        handoff.signal_ready_and_wait_for_release();
+        window.set_visible(true);
+        window.request_redraw();
+        startup_trace.mark("reload handoff released");
+    }
     let mut modifiers = ModifiersState::empty();
     let mut cursor_position = winit::dpi::PhysicalPosition::new(0.0, 0.0);
     let mut selecting_body = false;
@@ -477,7 +554,7 @@ async fn run() -> Result<()> {
     let mut power_inhibitor = power_inhibit::PowerInhibitor::new();
     let (session_event_tx, session_event_rx) = mpsc::channel();
     spawn_session_event_forwarder(session_event_rx, event_loop_proxy.clone());
-    let mut recovery_scan_pending = app.is_single_session();
+    let mut recovery_scan_pending = app.is_single_session() && !desktop_gallery;
     let mut first_frame_presented = false;
     let mut first_content_frame_presented = false;
     let mut interaction_latency = DesktopInteractionLatencyProfiler::new();
@@ -511,6 +588,7 @@ async fn run() -> Result<()> {
         let backend_wake = pending_backend_redraw_since
             .and(last_backend_redraw_request)
             .map(|last| last + BACKEND_REDRAW_FRAME_INTERVAL);
+        let hot_reload_wake = hot_reloader.next_wake(event_loop_now);
         let space_hold_wake = space_hold_started_at.and_then(|started_at| match &app {
             DesktopApp::Workspace(workspace) if !space_hold_consumed => {
                 Some(started_at + workspace.space_hold_toggle_duration())
@@ -520,6 +598,7 @@ async fn run() -> Result<()> {
         let wake = [
             default_wake,
             backend_wake,
+            hot_reload_wake,
             space_hold_wake,
             surface_timeout_redraw_at,
         ]
@@ -560,12 +639,10 @@ async fn run() -> Result<()> {
                 WindowEvent::CloseRequested => target.exit(),
                 WindowEvent::Resized(size) => {
                     pending_resize = Some(size);
-                    scroll_metrics_cache.clear();
                     window.request_redraw();
                 }
                 WindowEvent::ScaleFactorChanged { .. } => {
                     pending_resize = Some(window.inner_size());
-                    scroll_metrics_cache.clear();
                     window.request_redraw();
                 }
                 WindowEvent::ModifiersChanged(new_modifiers) => {
@@ -758,7 +835,12 @@ async fn run() -> Result<()> {
                             if let DesktopApp::Workspace(workspace) = &app {
                                 queue_desktop_preferences_save(workspace, &preferences_save_tx);
                             }
-                            if let Err(error) =
+                            if app.promote_focused_workspace_session() {
+                                scroll_accumulator = ScrollLineAccumulator::default();
+                                scroll_metrics_cache = SingleSessionScrollMetricsCache::default();
+                                window.set_title(&app.status_title());
+                                window.request_redraw();
+                            } else if let Err(error) =
                                 session_launch::launch_validated_resume_session(&session_id, &title)
                             {
                                 desktop_log::error(format_args!(
@@ -863,6 +945,14 @@ async fn run() -> Result<()> {
                             window.set_title(&app.status_title());
                             window.request_redraw();
                         }
+                        KeyOutcome::CopyText {
+                            text,
+                            success_notice,
+                        } => {
+                            copy_text_to_clipboard(&text, success_notice, &mut app);
+                            window.set_title(&app.status_title());
+                            window.request_redraw();
+                        }
                         KeyOutcome::CutDraftToClipboard(text) => {
                             copy_text_to_clipboard(&text, "cut input line", &mut app);
                             window.set_title(&app.status_title());
@@ -932,6 +1022,119 @@ async fn run() -> Result<()> {
                             } else {
                                 app.apply_session_event(session_launch::DesktopSessionEvent::Status(
                                     DesktopSessionStatus::SwitchingModel,
+                                ));
+                            }
+                            window.set_title(&app.status_title());
+                            window.request_redraw();
+                        }
+                        KeyOutcome::RefreshModelCatalog => {
+                            if let Err(error) = session_launch::spawn_refresh_models(
+                                app.single_session_live_id(),
+                                session_event_tx.clone(),
+                            ) {
+                                apply_single_session_error(&mut app, error);
+                            }
+                            window.set_title(&app.status_title());
+                            window.request_redraw();
+                        }
+                        KeyOutcome::SetReasoningEffort(effort) => {
+                            if let Err(error) = session_launch::spawn_set_reasoning_effort(
+                                effort,
+                                app.single_session_live_id(),
+                                session_event_tx.clone(),
+                            ) {
+                                apply_single_session_error(&mut app, error);
+                            } else {
+                                app.apply_session_event(session_launch::DesktopSessionEvent::Status(
+                                    DesktopSessionStatus::SwitchingReasoningEffort,
+                                ));
+                            }
+                            window.set_title(&app.status_title());
+                            window.request_redraw();
+                        }
+                        KeyOutcome::SetServiceTier(service_tier) => {
+                            if let Err(error) = session_launch::spawn_set_service_tier(
+                                service_tier,
+                                app.single_session_live_id(),
+                                session_event_tx.clone(),
+                            ) {
+                                apply_single_session_error(&mut app, error);
+                            } else {
+                                app.apply_session_event(session_launch::DesktopSessionEvent::Status(
+                                    DesktopSessionStatus::external("setting fast mode"),
+                                ));
+                            }
+                            window.set_title(&app.status_title());
+                            window.request_redraw();
+                        }
+                        KeyOutcome::SetTransport(transport) => {
+                            if let Err(error) = session_launch::spawn_set_transport(
+                                transport,
+                                app.single_session_live_id(),
+                                session_event_tx.clone(),
+                            ) {
+                                apply_single_session_error(&mut app, error);
+                            } else {
+                                app.apply_session_event(session_launch::DesktopSessionEvent::Status(
+                                    DesktopSessionStatus::external("setting transport"),
+                                ));
+                            }
+                            window.set_title(&app.status_title());
+                            window.request_redraw();
+                        }
+                        KeyOutcome::SetCompactionMode(mode) => {
+                            if let Err(error) = session_launch::spawn_set_compaction_mode(
+                                mode,
+                                app.single_session_live_id(),
+                                session_event_tx.clone(),
+                            ) {
+                                apply_single_session_error(&mut app, error);
+                            } else {
+                                app.apply_session_event(session_launch::DesktopSessionEvent::Status(
+                                    DesktopSessionStatus::external("setting compaction mode"),
+                                ));
+                            }
+                            window.set_title(&app.status_title());
+                            window.request_redraw();
+                        }
+                        KeyOutcome::CompactSession => {
+                            if let Err(error) = session_launch::spawn_compact_session(
+                                app.single_session_live_id(),
+                                session_event_tx.clone(),
+                            ) {
+                                apply_single_session_error(&mut app, error);
+                            } else {
+                                app.apply_session_event(session_launch::DesktopSessionEvent::Status(
+                                    DesktopSessionStatus::external("requesting compaction"),
+                                ));
+                            }
+                            window.set_title(&app.status_title());
+                            window.request_redraw();
+                        }
+                        KeyOutcome::RenameSession(title) => {
+                            if let Err(error) = session_launch::spawn_rename_session(
+                                title,
+                                app.single_session_live_id(),
+                                session_event_tx.clone(),
+                            ) {
+                                apply_single_session_error(&mut app, error);
+                            } else {
+                                app.apply_session_event(session_launch::DesktopSessionEvent::Status(
+                                    DesktopSessionStatus::external("renaming session"),
+                                ));
+                            }
+                            window.set_title(&app.status_title());
+                            window.request_redraw();
+                        }
+                        KeyOutcome::ClearServerSession => {
+                            if let Err(error) = session_launch::spawn_clear_server_session(
+                                app.single_session_live_id(),
+                                session_event_tx.clone(),
+                            ) {
+                                apply_single_session_error(&mut app, error);
+                            } else {
+                                app.apply_session_event(session_launch::DesktopSessionEvent::Status(
+                                    DesktopSessionStatus::external("clearing session"),
                                 ));
                             }
                             window.set_title(&app.status_title());
@@ -1275,15 +1478,9 @@ async fn run() -> Result<()> {
                         window.request_redraw();
                     }
                 }
-                if let Some(relaunch) = hot_reloader.poll(&app) {
-                    if let Err(error) = relaunch.spawn() {
-                        desktop_log::error(format_args!(
-                            "jcode-desktop: failed to hot reload desktop: {error:#}"
-                        ));
-                    } else {
-                        target.exit();
-                        return;
-                    }
+                if hot_reloader.poll(&app, &window) {
+                    target.exit();
+                    return;
                 }
 
                 if surface_renderable && canvas.needs_initial_frame {
@@ -1541,6 +1738,7 @@ const DESKTOP_HELP_LINES: &[&str] = &[
     "  --startup-log                Print launch timing milestones to stderr",
     "  --startup-benchmark          Print launch timings and exit after the first frame",
     "  --capture-hero-animation DIR Write deterministic hero animation PNG frames and exit",
+    "  --resize-render-benchmark[N]  Print CPU resize/render benchmark JSON and exit",
     "  --scroll-render-benchmark[N]  Print CPU scroll/render benchmark JSON and exit",
     "  --stream-e2e-benchmark[N]     Print stream event-to-paint guardrail JSON and exit",
     "  --headless-chat-smoke <MSG>  Run a hidden backend smoke test and print JSON events",
@@ -1552,33 +1750,6 @@ const DESKTOP_HELP_LINES: &[&str] = &[
 
 fn desktop_help_text() -> String {
     DESKTOP_HELP_LINES.join("\n")
-}
-
-fn startup_log_requested(args: &[String]) -> bool {
-    args.iter().any(|arg| arg == "--startup-log")
-        || std::env::var_os("JCODE_DESKTOP_STARTUP_LOG").is_some_and(env_flag_enabled)
-}
-
-fn startup_benchmark_requested(args: &[String]) -> bool {
-    args.iter().any(|arg| arg == "--startup-benchmark")
-}
-
-fn startup_content_benchmark_requested(args: &[String]) -> bool {
-    args.iter().any(|arg| arg == "--startup-content-benchmark")
-}
-
-fn scroll_render_benchmark_frames(args: &[String]) -> Option<usize> {
-    args.iter().enumerate().find_map(|(index, arg)| {
-        arg.strip_prefix("--scroll-render-benchmark=")
-            .and_then(|value| value.parse::<usize>().ok())
-            .or_else(|| {
-                (arg == "--scroll-render-benchmark").then(|| {
-                    args.get(index + 1)
-                        .and_then(|value| value.parse::<usize>().ok())
-                        .unwrap_or(600)
-                })
-            })
-    })
 }
 
 fn hero_screenshot_capture_dir(args: &[String]) -> Option<PathBuf> {
@@ -2009,6 +2180,24 @@ fn run_headless_chat_smoke(message: String) -> Result<()> {
                     serde_json::json!({"event": "session", "session_id": id})
                 );
             }
+            session_launch::DesktopSessionEvent::SessionRenamed {
+                title,
+                display_title,
+            } => {
+                last_status = Some(if title.is_some() {
+                    format!("renamed session to {display_title}")
+                } else {
+                    format!("cleared session name; title is now {display_title}")
+                });
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "session_renamed",
+                        "title": title,
+                        "display_title": display_title,
+                    })
+                );
+            }
             session_launch::DesktopSessionEvent::Reloaded { session_id: id } => {
                 session_id = Some(id.clone());
                 last_status = Some("server reconnected".to_string());
@@ -2114,6 +2303,7 @@ fn run_headless_chat_smoke(message: String) -> Result<()> {
                 current_model,
                 provider_name,
                 models,
+                ..
             } => {
                 last_status = Some(format!("models loaded ({})", models.len()));
                 println!(
@@ -2188,6 +2378,241 @@ fn run_headless_chat_smoke(message: String) -> Result<()> {
         response.chars().count(),
         last_status.as_deref().unwrap_or("unknown")
     )
+}
+
+fn run_resize_render_benchmark(frames: usize) -> Result<()> {
+    let frames = frames.max(1);
+    let target_p95_ms = 16.0;
+    let target_max_ms = 33.0;
+    let base_size = PhysicalSize::new(1200, 760);
+    let mut app = desktop_large_transcript_benchmark_app();
+    let initial_body_lines = single_session_rendered_body_lines_for_tick(&app, base_size, 0);
+    if let Some(metrics) = single_session_body_scroll_metrics_for_total_lines(
+        &app,
+        base_size,
+        initial_body_lines.len(),
+    ) {
+        app.body_scroll_lines = metrics.max_scroll_lines as f32 / 2.0;
+    }
+    let sizes = (0..frames).map(benchmark_resize_size).collect::<Vec<_>>();
+
+    let mut legacy_font_system = benchmark_font_system();
+    let (legacy_samples, legacy_checksum) = benchmark_frame_samples(frames, |frame| {
+        let size = sizes[frame];
+        let tick = frame as u64;
+        let key = single_session_text_key_for_tick_with_scroll(&app, size, tick, 0.0);
+        let buffers = single_session_text_buffers_from_key(&key, size, &mut legacy_font_system);
+        let areas = single_session_text_areas_for_app_with_scroll(&app, &buffers, size, tick, 0.0);
+        let body_glyphs = buffers
+            .get(1)
+            .map(|buffer| {
+                buffer
+                    .layout_runs()
+                    .map(|run| run.glyphs.len())
+                    .sum::<usize>()
+            })
+            .unwrap_or_default();
+        let vertices =
+            build_single_session_vertices_with_scroll_and_reveal(&app, size, 0.0, tick, 0.0, 1.0);
+        key.body.len() ^ buffers.len() ^ areas.len() ^ vertices.len() ^ body_glyphs
+    });
+
+    let mut optimized_font_system = benchmark_font_system();
+    let mut optimized_raw_body_key = None;
+    let mut optimized_raw_body_lines = Vec::new();
+    let mut optimized_body_key = None;
+    let mut optimized_body_lines = Vec::new();
+    let mut optimized_text_cache_key = None;
+    let mut optimized_text_key = None;
+    let mut optimized_buffers: Vec<Buffer> = Vec::new();
+    let mut optimized_window_start = None;
+    let mut optimized_window_end = None;
+    let mut optimized_body_rebuilds = 0usize;
+    let mut optimized_body_wraps = 0usize;
+    let (optimized_samples, optimized_checksum) = benchmark_frame_samples(frames, |frame| {
+        let size = sizes[frame];
+        let tick = frame as u64;
+        let body_layout_size = single_session_body_layout_cache_size(&app, size);
+        let body_key = app.rendered_body_cache_key(body_layout_size);
+        let rendered_body_changed = if optimized_body_key != Some(body_key) {
+            let raw_body_key = app.rendered_body_cache_key((0, 0));
+            if optimized_raw_body_key != Some(raw_body_key) {
+                optimized_raw_body_lines = app.body_styled_lines_for_tick(tick);
+                optimized_raw_body_key = Some(raw_body_key);
+            }
+            optimized_body_lines = single_session_rendered_body_lines_from_raw_ref(
+                &app,
+                size,
+                &optimized_raw_body_lines,
+            );
+            optimized_body_key = Some(body_key);
+            optimized_window_start = None;
+            optimized_window_end = None;
+            optimized_body_wraps += 1;
+            true
+        } else {
+            false
+        };
+
+        let viewport =
+            single_session_body_viewport_from_lines(&app, size, 0.0, &optimized_body_lines);
+        let text_cache_key = single_session_text_buffer_cache_key(&app, size, tick, body_key);
+        let key = single_session_text_key_for_tick_with_rendered_body(
+            &app,
+            size,
+            tick,
+            0.0,
+            &optimized_body_lines,
+        );
+        let text_key_changed = optimized_text_key.as_ref() != Some(&key);
+        if optimized_text_cache_key != Some(text_cache_key) || text_key_changed {
+            let desired_body_window = single_session_body_text_window_bounds(&viewport);
+            let body_window_contains = if let (Some(window_start), Some(window_end)) =
+                (optimized_window_start, optimized_window_end)
+            {
+                single_session_body_text_window_contains(window_start, window_end, &viewport)
+            } else {
+                false
+            };
+            let previous_key = optimized_text_key.take();
+            let mut old_buffers = std::mem::take(&mut optimized_buffers);
+            let body_content_changed_in_buffer =
+                rendered_body_changed && app.streaming_response.is_empty();
+            let body_layout_compatible = previous_key.as_ref().is_some_and(|previous| {
+                single_session_body_text_buffer_layout_compatible(
+                    previous.size,
+                    size,
+                    app.text_scale(),
+                )
+            });
+            let mut can_reuse_body_buffer = old_buffers.len() > 1
+                && body_window_contains
+                && !body_content_changed_in_buffer
+                && body_layout_compatible;
+            if old_buffers.len() > 1
+                && (!body_window_contains
+                    || body_content_changed_in_buffer
+                    || !body_layout_compatible)
+            {
+                let (window_start, window_end) = desired_body_window;
+                old_buffers[1] = single_session_body_text_buffer_from_lines(
+                    &mut optimized_font_system,
+                    &optimized_body_lines[window_start..window_end],
+                    size,
+                    app.text_scale(),
+                );
+                optimized_window_start = Some(window_start);
+                optimized_window_end = Some(window_end);
+                optimized_body_rebuilds += 1;
+                can_reuse_body_buffer = true;
+            }
+            optimized_buffers = single_session_text_buffers_from_key_reusing_unchanged(
+                &key,
+                previous_key.as_ref(),
+                old_buffers,
+                can_reuse_body_buffer,
+                size,
+                &mut optimized_font_system,
+            );
+            optimized_text_key = Some(key);
+            optimized_text_cache_key = Some(text_cache_key);
+            if !can_reuse_body_buffer {
+                optimized_window_start = None;
+                optimized_window_end = None;
+            }
+        }
+
+        let viewport =
+            single_session_body_viewport_from_lines(&app, size, 0.0, &optimized_body_lines);
+        if let (Some(window_start), Some(window_end)) =
+            (optimized_window_start, optimized_window_end)
+            && single_session_body_text_window_contains(window_start, window_end, &viewport)
+        {
+            if let Some(body_buffer) = optimized_buffers.get_mut(1) {
+                body_buffer.set_scroll(
+                    viewport
+                        .start_line
+                        .saturating_sub(window_start)
+                        .min(i32::MAX as usize) as i32,
+                );
+            }
+        } else {
+            let (window_start, window_end) = single_session_body_text_window_bounds(&viewport);
+            if let Some(body_buffer) = optimized_buffers.get_mut(1) {
+                *body_buffer = single_session_body_text_buffer_from_lines(
+                    &mut optimized_font_system,
+                    &optimized_body_lines[window_start..window_end],
+                    size,
+                    app.text_scale(),
+                );
+                body_buffer.set_scroll(
+                    viewport
+                        .start_line
+                        .saturating_sub(window_start)
+                        .min(i32::MAX as usize) as i32,
+                );
+                optimized_body_rebuilds += 1;
+            }
+            optimized_window_start = Some(window_start);
+            optimized_window_end = Some(window_end);
+        }
+
+        let areas = single_session_text_areas_for_app_with_cached_body_viewport(
+            &app,
+            &optimized_buffers,
+            size,
+            0.0,
+            viewport,
+        );
+        let body_glyphs = optimized_buffers
+            .get(1)
+            .map(|buffer| {
+                buffer
+                    .layout_runs()
+                    .map(|run| run.glyphs.len())
+                    .sum::<usize>()
+            })
+            .unwrap_or_default();
+        let vertices = build_single_session_vertices_with_cached_body(
+            &app,
+            size,
+            0.0,
+            tick,
+            0.0,
+            1.0,
+            &optimized_body_lines,
+        );
+        optimized_body_lines.len()
+            ^ optimized_buffers.len()
+            ^ areas.len()
+            ^ vertices.len()
+            ^ body_glyphs
+    });
+
+    let optimized_p95 = percentile_ms(&optimized_samples, 0.95);
+    let optimized_max = max_sample_ms(&optimized_samples);
+    let passes_resize_cpu_budget = optimized_p95 <= target_p95_ms && optimized_max <= target_max_ms;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "frames": frames,
+            "target_p95_ms": target_p95_ms,
+            "target_repeated_max_ms": target_max_ms,
+            "passes_resize_cpu_budget": passes_resize_cpu_budget,
+            "scenario": "large transcript continuous resize CPU layout path",
+            "size_range": {
+                "min_width": sizes.iter().map(|size| size.width).min().unwrap_or_default(),
+                "max_width": sizes.iter().map(|size| size.width).max().unwrap_or_default(),
+                "min_height": sizes.iter().map(|size| size.height).min().unwrap_or_default(),
+                "max_height": sizes.iter().map(|size| size.height).max().unwrap_or_default(),
+            },
+            "optimized_body_wraps": optimized_body_wraps,
+            "optimized_body_buffer_rebuilds": optimized_body_rebuilds,
+            "legacy": benchmark_samples_json("legacy_resize_full_text_relayout", &legacy_samples, legacy_checksum),
+            "optimized": benchmark_samples_json("optimized_resize_cached_visible_body", &optimized_samples, optimized_checksum),
+        }))?
+    );
+    Ok(())
 }
 
 fn run_scroll_render_benchmark(frames: usize) -> Result<()> {
@@ -2862,6 +3287,7 @@ fn run_scroll_render_benchmark(frames: usize) -> Result<()> {
                 viewport,
                 start_line,
                 1.0,
+                0.0,
             ));
         }
         streaming_areas_ms += phase_started.elapsed().as_secs_f64() * 1000.0;
@@ -3566,41 +3992,6 @@ fn run_stream_e2e_benchmark(raw_events: usize) -> Result<()> {
     Ok(())
 }
 
-fn benchmark_phase(mut frames: usize, mut run_frame: impl FnMut(usize) -> usize) -> (f64, usize) {
-    frames = frames.max(1);
-    let started = Instant::now();
-    let mut checksum = 0usize;
-    for frame in 0..frames {
-        checksum ^= std::hint::black_box(run_frame(frame));
-    }
-    (started.elapsed().as_secs_f64() * 1000.0, checksum)
-}
-
-fn benchmark_phase_json(
-    name: &str,
-    total_ms: f64,
-    frames: usize,
-    checksum: usize,
-) -> serde_json::Value {
-    let frames = frames.max(1);
-    serde_json::json!({
-        "name": name,
-        "total_ms": total_ms,
-        "mean_ms_per_frame": total_ms / frames as f64,
-        "mean_us_per_frame": total_ms * 1000.0 / frames as f64,
-        "checksum": checksum,
-    })
-}
-
-fn benchmark_smooth_scroll_lines(frame: usize) -> f32 {
-    ((frame % 16) as f32 / 16.0) - 0.5
-}
-
-fn benchmark_typing_char(frame: usize) -> char {
-    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz     .,;";
-    CHARS[frame % CHARS.len()] as char
-}
-
 fn benchmark_hero_boundary_scroll_lines(
     app: &SingleSessionApp,
     size: PhysicalSize<u32>,
@@ -3772,9 +4163,11 @@ fn initial_single_session_app(resume_session_id: Option<&str>) -> DesktopApp {
     match session_data::load_session_card_by_id(session_id) {
         Ok(Some(card)) => {
             app.replace_session(Some(card));
+            app.hydrate_resumed_session_from_disk(session_id);
         }
         Ok(None) => {
             app.set_status_label(format!("resumed session {session_id}"));
+            app.hydrate_resumed_session_from_disk(session_id);
         }
         Err(error) => {
             desktop_log::error(format_args!(
@@ -3825,10 +4218,265 @@ fn desktop_resume_session_id_from_args<'a>(
     None
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DesktopReloadWindowPlacement {
+    position: Option<PhysicalPosition<i32>>,
+    inner_size: PhysicalSize<u32>,
+}
+
+impl DesktopReloadWindowPlacement {
+    fn from_window(window: &Window) -> Option<Self> {
+        let inner_size = window.inner_size();
+        if !desktop_reload_window_size_is_valid(inner_size) {
+            return None;
+        }
+        Some(Self {
+            position: window.outer_position().ok(),
+            inner_size,
+        })
+    }
+
+    fn from_env_value(raw: &str) -> Option<Self> {
+        let parts = raw.split(',').collect::<Vec<_>>();
+        if parts.len() != 4 {
+            return None;
+        }
+
+        let position = match (parts[0], parts[1]) {
+            ("_", "_") => None,
+            (x, y) => Some(PhysicalPosition::new(x.parse().ok()?, y.parse().ok()?)),
+        };
+        let inner_size = PhysicalSize::new(parts[2].parse().ok()?, parts[3].parse().ok()?);
+        if !desktop_reload_window_size_is_valid(inner_size) {
+            return None;
+        }
+        Some(Self {
+            position,
+            inner_size,
+        })
+    }
+
+    fn to_env_value(self) -> String {
+        let (x, y) = match self.position {
+            Some(position) => (position.x.to_string(), position.y.to_string()),
+            None => ("_".to_string(), "_".to_string()),
+        };
+        format!(
+            "{x},{y},{},{}",
+            self.inner_size.width, self.inner_size.height
+        )
+    }
+
+    fn apply_to_window_builder(self, mut window_builder: WindowBuilder) -> WindowBuilder {
+        window_builder = window_builder.with_inner_size(self.inner_size);
+        if let Some(position) = self.position {
+            window_builder = window_builder.with_position(position);
+        }
+        window_builder
+    }
+}
+
+fn desktop_reload_window_size_is_valid(size: PhysicalSize<u32>) -> bool {
+    (1..=DESKTOP_RELOAD_MAX_RESTORED_DIMENSION).contains(&size.width)
+        && (1..=DESKTOP_RELOAD_MAX_RESTORED_DIMENSION).contains(&size.height)
+}
+
+#[derive(Clone, Debug, Default)]
+struct DesktopReloadStartup {
+    window_placement: Option<DesktopReloadWindowPlacement>,
+    handoff: Option<DesktopReloadStartupHandoff>,
+}
+
+impl DesktopReloadStartup {
+    fn from_env() -> Self {
+        let raw_window_placement = std::env::var(DESKTOP_RELOAD_WINDOW_ENV).ok();
+        let ready_file = std::env::var_os(DESKTOP_RELOAD_HANDOFF_READY_ENV).map(PathBuf::from);
+        let release_file = std::env::var_os(DESKTOP_RELOAD_HANDOFF_RELEASE_ENV).map(PathBuf::from);
+        unsafe {
+            std::env::remove_var(DESKTOP_RELOAD_WINDOW_ENV);
+            std::env::remove_var(DESKTOP_RELOAD_HANDOFF_READY_ENV);
+            std::env::remove_var(DESKTOP_RELOAD_HANDOFF_RELEASE_ENV);
+        }
+
+        let window_placement = raw_window_placement.as_deref().and_then(|raw| {
+            let placement = DesktopReloadWindowPlacement::from_env_value(raw);
+            if placement.is_none() {
+                desktop_log::warn(format_args!(
+                    "jcode-desktop: ignoring invalid reload window placement {raw:?}"
+                ));
+            }
+            placement
+        });
+        let handoff = match (ready_file, release_file) {
+            (Some(ready_file), Some(release_file)) => Some(DesktopReloadStartupHandoff {
+                ready_file,
+                release_file,
+            }),
+            (None, None) => None,
+            _ => {
+                desktop_log::warn(format_args!(
+                    "jcode-desktop: ignoring incomplete reload handoff environment"
+                ));
+                None
+            }
+        };
+
+        Self {
+            window_placement,
+            handoff,
+        }
+    }
+
+    fn hidden_until_handoff_release(&self) -> bool {
+        self.handoff.is_some()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DesktopReloadStartupHandoff {
+    ready_file: PathBuf,
+    release_file: PathBuf,
+}
+
+impl DesktopReloadStartupHandoff {
+    fn signal_ready_and_wait_for_release(&self) {
+        if let Err(error) = write_desktop_reload_marker(&self.ready_file) {
+            desktop_log::warn(format_args!(
+                "jcode-desktop: failed to signal reload readiness: {error:#}"
+            ));
+            return;
+        }
+
+        desktop_log::info(format_args!(
+            "jcode-desktop: reload child ready, waiting for parent release"
+        ));
+        let deadline = Instant::now() + DESKTOP_RELOAD_STARTUP_RELEASE_TIMEOUT;
+        while Instant::now() < deadline {
+            if self.release_file.exists() {
+                cleanup_desktop_reload_handoff_files(&self.ready_file, &self.release_file);
+                return;
+            }
+            std::thread::sleep(DESKTOP_RELOAD_HANDOFF_POLL_INTERVAL);
+        }
+
+        desktop_log::warn(format_args!(
+            "jcode-desktop: reload parent did not release handoff within {}ms; showing replacement window anyway",
+            DESKTOP_RELOAD_STARTUP_RELEASE_TIMEOUT.as_millis()
+        ));
+        cleanup_desktop_reload_handoff_files(&self.ready_file, &self.release_file);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DesktopReloadHandoff {
+    ready_file: PathBuf,
+    release_file: PathBuf,
+    window_placement: Option<DesktopReloadWindowPlacement>,
+}
+
+impl DesktopReloadHandoff {
+    fn new(window: &Window) -> Result<Self> {
+        let dir = desktop_reload_handoff_temp_dir();
+        fs::create_dir_all(&dir).with_context(|| {
+            format!(
+                "failed to create desktop reload handoff directory {}",
+                dir.display()
+            )
+        })?;
+        Ok(Self {
+            ready_file: dir.join("ready"),
+            release_file: dir.join("release"),
+            window_placement: DesktopReloadWindowPlacement::from_window(window),
+        })
+    }
+
+    fn apply_to_command(&self, command: &mut Command) {
+        if let Some(placement) = self.window_placement {
+            command.env(DESKTOP_RELOAD_WINDOW_ENV, placement.to_env_value());
+        }
+        command.env(DESKTOP_RELOAD_HANDOFF_READY_ENV, &self.ready_file);
+        command.env(DESKTOP_RELOAD_HANDOFF_RELEASE_ENV, &self.release_file);
+    }
+
+    fn watcher(&self) -> DesktopReloadHandoffWatcher {
+        DesktopReloadHandoffWatcher {
+            ready_file: self.ready_file.clone(),
+            release_file: self.release_file.clone(),
+            spawned_at: Instant::now(),
+        }
+    }
+
+    fn cleanup(&self) {
+        cleanup_desktop_reload_handoff_files(&self.ready_file, &self.release_file);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DesktopReloadHandoffWatcher {
+    ready_file: PathBuf,
+    release_file: PathBuf,
+    spawned_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DesktopReloadHandoffPoll {
+    Waiting,
+    Ready,
+    TimedOut,
+}
+
+impl DesktopReloadHandoffWatcher {
+    fn poll(&self) -> Result<DesktopReloadHandoffPoll> {
+        if self.ready_file.exists() {
+            write_desktop_reload_marker(&self.release_file)?;
+            return Ok(DesktopReloadHandoffPoll::Ready);
+        }
+        if self.spawned_at.elapsed() >= DESKTOP_RELOAD_HANDOFF_TIMEOUT {
+            return Ok(DesktopReloadHandoffPoll::TimedOut);
+        }
+        Ok(DesktopReloadHandoffPoll::Waiting)
+    }
+
+    fn cleanup(&self) {
+        cleanup_desktop_reload_handoff_files(&self.ready_file, &self.release_file);
+    }
+}
+
+fn desktop_reload_handoff_temp_dir() -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "jcode-desktop-reload-{}-{nonce}",
+        std::process::id()
+    ))
+}
+
+fn write_desktop_reload_marker(path: &Path) -> Result<()> {
+    fs::write(path, format!("{}\n", std::process::id()))
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn cleanup_desktop_reload_handoff_files(ready_file: &Path, release_file: &Path) {
+    let _ = fs::remove_file(ready_file);
+    let _ = fs::remove_file(release_file);
+    if ready_file.parent() == release_file.parent()
+        && let Some(parent) = ready_file.parent()
+        && parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("jcode-desktop-reload-"))
+    {
+        let _ = fs::remove_dir(parent);
+    }
+}
+
 struct DesktopHotReloader {
     relaunch: Option<DesktopRelaunch>,
     observed_modified: Option<std::time::SystemTime>,
     last_checked: Instant,
+    pending_handoff: Option<DesktopReloadHandoffWatcher>,
 }
 
 impl DesktopHotReloader {
@@ -3843,24 +4491,85 @@ impl DesktopHotReloader {
             relaunch,
             observed_modified,
             last_checked: Instant::now(),
+            pending_handoff: None,
         }
     }
 
-    fn poll(&mut self, app: &DesktopApp) -> Option<DesktopRelaunch> {
+    fn next_wake(&self, now: Instant) -> Option<Instant> {
+        if self.pending_handoff.is_some() {
+            return Some(now + DESKTOP_RELOAD_HANDOFF_POLL_INTERVAL);
+        }
+        self.relaunch.as_ref()?;
+        Some(std::cmp::max(now, self.last_checked + Self::CHECK_INTERVAL))
+    }
+
+    fn poll(&mut self, app: &DesktopApp, window: &Window) -> bool {
+        if self.poll_pending_handoff() {
+            return true;
+        }
+        if self.pending_handoff.is_some() {
+            return false;
+        }
         if self.last_checked.elapsed() < Self::CHECK_INTERVAL {
-            return None;
+            return false;
         }
         self.last_checked = Instant::now();
 
-        let relaunch = self.relaunch.as_ref()?;
+        let Some(relaunch) = self.relaunch.as_ref() else {
+            return false;
+        };
         let binary = desktop_reload_binary_candidate(&relaunch.binary);
-        let current_modified = binary_modified_time(&binary)?;
+        let Some(current_modified) = binary_modified_time(&binary) else {
+            return false;
+        };
         let observed_modified = self.observed_modified;
         self.observed_modified = Some(current_modified);
         if observed_modified.is_some_and(|observed| current_modified > observed) {
-            return Some(relaunch.for_app(app, binary));
+            let relaunch = relaunch.for_app(app, binary);
+            match relaunch.spawn_for_window(window) {
+                Ok(Some(handoff)) => {
+                    self.pending_handoff = Some(handoff);
+                }
+                Ok(None) => return true,
+                Err(error) => {
+                    desktop_log::error(format_args!(
+                        "jcode-desktop: failed to hot reload desktop: {error:#}"
+                    ));
+                }
+            }
         }
-        None
+        false
+    }
+
+    fn poll_pending_handoff(&mut self) -> bool {
+        let Some(pending_handoff) = self.pending_handoff.as_ref() else {
+            return false;
+        };
+        match pending_handoff.poll() {
+            Ok(DesktopReloadHandoffPoll::Waiting) => false,
+            Ok(DesktopReloadHandoffPoll::Ready) => {
+                desktop_log::info(format_args!(
+                    "jcode-desktop: reload replacement is ready; exiting old process"
+                ));
+                true
+            }
+            Ok(DesktopReloadHandoffPoll::TimedOut) => {
+                desktop_log::warn(format_args!(
+                    "jcode-desktop: reload replacement did not become ready within {}ms; keeping old process alive",
+                    DESKTOP_RELOAD_HANDOFF_TIMEOUT.as_millis()
+                ));
+                if let Some(pending_handoff) = self.pending_handoff.take() {
+                    pending_handoff.cleanup();
+                }
+                false
+            }
+            Err(error) => {
+                desktop_log::error(format_args!(
+                    "jcode-desktop: failed to release reload replacement: {error:#}"
+                ));
+                true
+            }
+        }
     }
 }
 
@@ -3887,20 +4596,53 @@ impl DesktopRelaunch {
         })
     }
 
-    fn spawn(&self) -> Result<()> {
+    fn spawn_for_window(&self, window: &Window) -> Result<Option<DesktopReloadHandoffWatcher>> {
+        let handoff = match DesktopReloadHandoff::new(window) {
+            Ok(handoff) => Some(handoff),
+            Err(error) => {
+                desktop_log::warn(format_args!(
+                    "jcode-desktop: reload handoff unavailable, falling back to immediate relaunch: {error:#}"
+                ));
+                None
+            }
+        };
         desktop_log::info(format_args!(
-            "jcode-desktop: hot reloading into {} with args {:?}",
+            "jcode-desktop: hot reloading into {} with args {:?}{}",
             self.binary.display(),
-            self.args
+            self.args,
+            if handoff.is_some() {
+                " using handoff"
+            } else {
+                ""
+            }
         ));
-        Command::new(&self.binary)
-            .args(&self.args)
-            .spawn()
-            .with_context(|| format!("failed to spawn {}", self.binary.display()))?;
-        Ok(())
+        let mut command = Command::new(&self.binary);
+        command.args(&self.args);
+        command.env_remove(DESKTOP_RELOAD_WINDOW_ENV);
+        command.env_remove(DESKTOP_RELOAD_HANDOFF_READY_ENV);
+        command.env_remove(DESKTOP_RELOAD_HANDOFF_RELEASE_ENV);
+        if let Some(handoff) = handoff.as_ref() {
+            handoff.apply_to_command(&mut command);
+        }
+        if let Err(error) = command.spawn() {
+            if let Some(handoff) = handoff.as_ref() {
+                handoff.cleanup();
+            }
+            return Err(error)
+                .with_context(|| format!("failed to spawn {}", self.binary.display()));
+        }
+        Ok(handoff.as_ref().map(DesktopReloadHandoff::watcher))
     }
 
     fn for_app(&self, app: &DesktopApp, binary: PathBuf) -> Self {
+        if let DesktopApp::Workspace(workspace) = app
+            && let Err(error) = desktop_prefs::save_preferences(&workspace.preferences())
+        {
+            desktop_log::error(format_args!(
+                "jcode-desktop: failed to persist workspace state before hot reload: {error:#}"
+            ));
+        }
+
         let mut args = desktop_args_without_resume(&self.args);
         if let Some(session_id) = app.single_session_live_id() {
             args.push(OsString::from("--resume"));
@@ -4090,6 +4832,21 @@ impl DesktopApp {
             Self::SingleSession(app) => app.handle_key(key),
             Self::Workspace(workspace) => workspace.handle_key(key),
         }
+    }
+
+    fn promote_focused_workspace_session(&mut self) -> bool {
+        let Self::Workspace(workspace) = self else {
+            return false;
+        };
+        let Some(card) = workspace.focused_session_card() else {
+            return false;
+        };
+        let session_id = card.session_id.clone();
+        let mut single_session = SingleSessionApp::new(Some(card));
+        single_session.initialize_resumed_session(&session_id);
+        single_session.hydrate_resumed_session_from_disk(&session_id);
+        *self = Self::SingleSession(single_session);
+        true
     }
 
     fn apply_session_event(&mut self, event: session_launch::DesktopSessionEvent) {
@@ -4317,8 +5074,15 @@ fn to_key_input(key: &Key, modifiers: ModifiersState) -> KeyInput {
         Key::Named(NamedKey::Escape) => KeyInput::Escape,
         Key::Named(NamedKey::Space) => KeyInput::Character(" ".to_string()),
         Key::Named(NamedKey::Enter) if modifiers.control_key() => KeyInput::QueueDraft,
-        Key::Named(NamedKey::Enter) if modifiers.shift_key() => KeyInput::Enter,
+        Key::Named(NamedKey::Enter) if modifiers.shift_key() || modifiers.alt_key() => {
+            KeyInput::Enter
+        }
         Key::Named(NamedKey::Enter) => KeyInput::SubmitDraft,
+        Key::Named(NamedKey::Tab) if modifiers.control_key() && modifiers.shift_key() => {
+            KeyInput::CycleModel(-1)
+        }
+        Key::Named(NamedKey::Tab) if modifiers.control_key() => KeyInput::CycleModel(1),
+        Key::Named(NamedKey::Tab) => KeyInput::Autocomplete,
         Key::Named(NamedKey::Backspace) if modifiers.control_key() || modifiers.alt_key() => {
             KeyInput::DeletePreviousWord
         }
@@ -4343,6 +5107,8 @@ fn to_key_input(key: &Key, modifiers: ModifiersState) -> KeyInput {
         }
         Key::Named(NamedKey::ArrowLeft) => KeyInput::MoveCursorLeft,
         Key::Named(NamedKey::ArrowRight) => KeyInput::MoveCursorRight,
+        Key::Named(NamedKey::Home) if modifiers.control_key() => KeyInput::ScrollBodyToTop,
+        Key::Named(NamedKey::End) if modifiers.control_key() => KeyInput::ScrollBodyToBottom,
         Key::Named(NamedKey::Home) => KeyInput::MoveToLineStart,
         Key::Named(NamedKey::End) => KeyInput::MoveToLineEnd,
         Key::Character(text) if modifiers.control_key() && text.eq_ignore_ascii_case("a") => {
@@ -4359,6 +5125,13 @@ fn to_key_input(key: &Key, modifiers: ModifiersState) -> KeyInput {
         }
         Key::Character(text) if modifiers.control_key() && text.eq_ignore_ascii_case("u") => {
             KeyInput::DeleteToLineStart
+        }
+        Key::Character(text)
+            if modifiers.control_key()
+                && modifiers.shift_key()
+                && text.eq_ignore_ascii_case("k") =>
+        {
+            KeyInput::CopyLatestCodeBlock
         }
         Key::Character(text) if modifiers.control_key() && text.eq_ignore_ascii_case("k") => {
             KeyInput::DeleteToLineEnd
@@ -4381,6 +5154,13 @@ fn to_key_input(key: &Key, modifiers: ModifiersState) -> KeyInput {
         }
         Key::Character(text)
             if modifiers.control_key()
+                && modifiers.shift_key()
+                && text.eq_ignore_ascii_case("t") =>
+        {
+            KeyInput::CopyTranscript
+        }
+        Key::Character(text)
+            if modifiers.control_key()
                 && (text.eq_ignore_ascii_case("c") || text.eq_ignore_ascii_case("d")) =>
         {
             KeyInput::CancelGeneration
@@ -4396,6 +5176,20 @@ fn to_key_input(key: &Key, modifiers: ModifiersState) -> KeyInput {
         }
         Key::Character(text) if modifiers.alt_key() && text.eq_ignore_ascii_case("v") => {
             KeyInput::AttachClipboardImage
+        }
+        Key::Character(text) if modifiers.control_key() && text == "[" => KeyInput::JumpPrompt(-1),
+        Key::Character(text) if modifiers.control_key() && text == "]" => KeyInput::JumpPrompt(1),
+        Key::Character(text) if modifiers.super_key() && text.eq_ignore_ascii_case("k") => {
+            KeyInput::ScrollBodyLines(1)
+        }
+        Key::Character(text) if modifiers.super_key() && text.eq_ignore_ascii_case("j") => {
+            KeyInput::ScrollBodyLines(-1)
+        }
+        Key::Character(text)
+            if (modifiers.control_key() || modifiers.super_key())
+                && text.eq_ignore_ascii_case("q") =>
+        {
+            KeyInput::ExitApp
         }
         Key::Character(text) if modifiers.control_key() && text == ";" => KeyInput::SpawnPanel,
         Key::Character(text) if modifiers.control_key() && (text == "?" || text == "/") => {
@@ -4612,6 +5406,7 @@ fn desktop_session_event_refreshes_session_card(
     matches!(
         event,
         session_launch::DesktopSessionEvent::SessionStarted { .. }
+            | session_launch::DesktopSessionEvent::SessionRenamed { .. }
             | session_launch::DesktopSessionEvent::Reloaded { .. }
             | session_launch::DesktopSessionEvent::Done
             | session_launch::DesktopSessionEvent::Error(_)
@@ -5151,6 +5946,8 @@ fn single_session_body_text_window_contains(
 struct SingleSessionScrollMetricsCache {
     key: Option<u64>,
     total_lines: usize,
+    raw_body_key: Option<u64>,
+    raw_body_lines: Vec<SingleSessionStyledLine>,
     streaming_base_key: Option<u64>,
     streaming_base_total_lines: usize,
 }
@@ -5161,10 +5958,11 @@ impl SingleSessionScrollMetricsCache {
         app: &SingleSessionApp,
         size: PhysicalSize<u32>,
     ) -> Option<SingleSessionBodyScrollMetrics> {
-        let key = app.rendered_body_cache_key((size.width, size.height));
+        let body_layout_size = single_session_body_layout_cache_size(app, size);
+        let key = app.rendered_body_cache_key(body_layout_size);
         if self.key != Some(key) {
             if !app.streaming_response.is_empty() {
-                let base_key = app.rendered_body_static_cache_key((size.width, size.height));
+                let base_key = app.rendered_body_static_cache_key(body_layout_size);
                 if self.streaming_base_key != Some(base_key) {
                     if let Some(base_lines) =
                         single_session_rendered_static_body_lines_for_streaming(app, size, 0)
@@ -5184,7 +5982,17 @@ impl SingleSessionScrollMetricsCache {
                         single_session_rendered_body_lines_for_tick(app, size, 0).len();
                 }
             } else {
-                self.total_lines = single_session_rendered_body_lines_for_tick(app, size, 0).len();
+                let raw_key = app.rendered_body_cache_key((0, 0));
+                if self.raw_body_key != Some(raw_key) {
+                    self.raw_body_lines = app.body_styled_lines_for_tick(0);
+                    self.raw_body_key = Some(raw_key);
+                }
+                self.total_lines = single_session_rendered_body_lines_from_raw_ref(
+                    app,
+                    size,
+                    &self.raw_body_lines,
+                )
+                .len();
                 self.streaming_base_key = None;
                 self.streaming_base_total_lines = 0;
             }
@@ -5196,6 +6004,8 @@ impl SingleSessionScrollMetricsCache {
     fn clear(&mut self) {
         self.key = None;
         self.total_lines = 0;
+        self.raw_body_key = None;
+        self.raw_body_lines.clear();
         self.streaming_base_key = None;
         self.streaming_base_total_lines = 0;
     }
@@ -5908,6 +6718,8 @@ struct Canvas {
     single_session_text_cache_key: Option<u64>,
     single_session_text_key: Option<SingleSessionTextKey>,
     single_session_text_buffers: Vec<Buffer>,
+    single_session_raw_body_key: Option<u64>,
+    single_session_raw_body_lines: Vec<SingleSessionStyledLine>,
     single_session_body_key: Option<u64>,
     single_session_body_lines: Vec<SingleSessionStyledLine>,
     single_session_streaming_base_key: Option<u64>,
@@ -5916,6 +6728,8 @@ struct Canvas {
     single_session_streaming_fade_started_at: Option<Instant>,
     single_session_streaming_text_key: Option<u64>,
     single_session_streaming_text_start_line: Option<usize>,
+    single_session_streaming_text_end_line: Option<usize>,
+    single_session_streaming_text_opacity_bits: Option<u32>,
     single_session_streaming_text_buffer: Option<Buffer>,
     single_session_body_text_scroll_start: Option<usize>,
     single_session_body_text_window_start: Option<usize>,
@@ -6017,6 +6831,8 @@ impl Canvas {
             single_session_text_cache_key: None,
             single_session_text_key: None,
             single_session_text_buffers: Vec::new(),
+            single_session_raw_body_key: None,
+            single_session_raw_body_lines: Vec::new(),
             single_session_body_key: None,
             single_session_body_lines: Vec::new(),
             single_session_streaming_base_key: None,
@@ -6025,6 +6841,8 @@ impl Canvas {
             single_session_streaming_fade_started_at: None,
             single_session_streaming_text_key: None,
             single_session_streaming_text_start_line: None,
+            single_session_streaming_text_end_line: None,
+            single_session_streaming_text_opacity_bits: None,
             single_session_streaming_text_buffer: None,
             single_session_body_text_scroll_start: None,
             single_session_body_text_window_start: None,
@@ -6065,25 +6883,14 @@ impl Canvas {
         }
 
         self.size = size;
-        self.single_session_text_cache_key = None;
-        self.single_session_text_key = None;
-        self.single_session_body_key = None;
-        self.single_session_streaming_base_key = None;
-        self.single_session_streaming_base_len = 0;
-        self.single_session_streaming_response_len = 0;
-        self.single_session_streaming_fade_started_at = None;
-        self.single_session_streaming_text_key = None;
-        self.single_session_streaming_text_start_line = None;
-        self.single_session_streaming_text_buffer = None;
-        self.streaming_text_needs_prepare = false;
-        self.single_session_body_text_scroll_start = None;
-        self.single_session_body_text_window_start = None;
-        self.single_session_body_text_window_end = None;
         self.primitive_vertices_cache_key = None;
         self.primitive_vertices_cache.clear();
         self.primitive_frame_vertices.clear();
         self.first_render_completed = false;
         self.text_needs_prepare = true;
+        if self.single_session_streaming_text_buffer.is_some() {
+            self.streaming_text_needs_prepare = true;
+        }
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
@@ -6142,9 +6949,22 @@ impl Canvas {
             let mut old_buffers = std::mem::take(&mut self.single_session_text_buffers);
             let body_content_changed_in_buffer =
                 rendered_body_changed && app.streaming_response.is_empty();
-            let mut can_reuse_body_buffer =
-                old_buffers.len() > 1 && body_window_contains && !body_content_changed_in_buffer;
-            if old_buffers.len() > 1 && (!body_window_contains || body_content_changed_in_buffer) {
+            let body_layout_compatible = previous_key.as_ref().is_some_and(|previous| {
+                single_session_body_text_buffer_layout_compatible(
+                    previous.size,
+                    self.size,
+                    app.text_scale(),
+                )
+            });
+            let mut can_reuse_body_buffer = old_buffers.len() > 1
+                && body_window_contains
+                && !body_content_changed_in_buffer
+                && body_layout_compatible;
+            if old_buffers.len() > 1
+                && (!body_window_contains
+                    || body_content_changed_in_buffer
+                    || !body_layout_compatible)
+            {
                 let (window_start, window_end) = desired_body_window;
                 old_buffers[1] = single_session_body_text_buffer_from_lines(
                     font_system,
@@ -6268,6 +7088,8 @@ impl Canvas {
         else {
             self.single_session_streaming_text_key = None;
             self.single_session_streaming_text_start_line = None;
+            self.single_session_streaming_text_end_line = None;
+            self.single_session_streaming_text_opacity_bits = None;
             self.single_session_streaming_text_buffer = None;
             self.streaming_text_needs_prepare = false;
             return;
@@ -6287,43 +7109,89 @@ impl Canvas {
         if let Some(font_system) = self.font_system.as_mut() {
             let lines = self.single_session_body_lines[start_line..end_line].to_vec();
             self.single_session_streaming_text_buffer =
-                Some(single_session_body_text_buffer_from_lines(
+                Some(single_session_body_text_buffer_from_lines_with_opacity(
                     font_system,
                     &lines,
                     self.size,
                     app.text_scale(),
+                    1.0,
                 ));
             self.single_session_streaming_text_key = Some(key);
             self.single_session_streaming_text_start_line = Some(start_line);
+            self.single_session_streaming_text_end_line = Some(end_line);
+            self.single_session_streaming_text_opacity_bits = Some(1.0f32.to_bits());
             self.streaming_text_needs_prepare = true;
         }
     }
 
     fn update_single_session_streaming_fade(&mut self, app: &SingleSessionApp) {
         let response_len = app.streaming_response.len();
-        if response_len == 0 {
-            self.single_session_streaming_response_len = 0;
-            self.single_session_streaming_fade_started_at = None;
-            return;
-        }
-
-        if response_len > self.single_session_streaming_response_len {
-            self.single_session_streaming_fade_started_at = Some(Instant::now());
-        }
+        self.single_session_streaming_fade_started_at = streaming_text_fade_start_after_len_change(
+            self.single_session_streaming_response_len,
+            response_len,
+            self.single_session_streaming_fade_started_at,
+            Instant::now(),
+        );
         self.single_session_streaming_response_len = response_len;
     }
 
-    fn single_session_streaming_fade_opacity(&mut self, now: Instant) -> (f32, bool) {
+    fn single_session_streaming_arrival_style(
+        &mut self,
+        now: Instant,
+    ) -> StreamingTextArrivalStyle {
         let Some(started_at) = self.single_session_streaming_fade_started_at else {
-            return (1.0, false);
+            return StreamingTextArrivalStyle {
+                opacity: 1.0,
+                y_offset_pixels: 0.0,
+                active: false,
+            };
         };
-        let (opacity, active) =
-            streaming_text_fade_opacity_for_elapsed(now.saturating_duration_since(started_at));
-        if !active {
+        let style =
+            streaming_text_arrival_style_for_elapsed(now.saturating_duration_since(started_at));
+        if !style.active {
             self.single_session_streaming_fade_started_at = None;
-            return (1.0, false);
+            return StreamingTextArrivalStyle {
+                opacity: 1.0,
+                y_offset_pixels: 0.0,
+                active: false,
+            };
         }
-        (opacity, true)
+        style
+    }
+
+    fn update_single_session_streaming_text_buffer_opacity(
+        &mut self,
+        app: &SingleSessionApp,
+        opacity: f32,
+    ) {
+        let opacity = opacity.clamp(0.0, 1.0);
+        let quantized_opacity = (opacity * 255.0).round() / 255.0;
+        let opacity_bits = quantized_opacity.to_bits();
+        if self.single_session_streaming_text_opacity_bits == Some(opacity_bits) {
+            return;
+        }
+        let (Some(start_line), Some(end_line), Some(font_system)) = (
+            self.single_session_streaming_text_start_line,
+            self.single_session_streaming_text_end_line,
+            self.font_system.as_mut(),
+        ) else {
+            return;
+        };
+        if start_line >= end_line || end_line > self.single_session_body_lines.len() {
+            return;
+        }
+
+        let lines = self.single_session_body_lines[start_line..end_line].to_vec();
+        self.single_session_streaming_text_buffer =
+            Some(single_session_body_text_buffer_from_lines_with_opacity(
+                font_system,
+                &lines,
+                self.size,
+                app.text_scale(),
+                quantized_opacity,
+            ));
+        self.single_session_streaming_text_opacity_bits = Some(opacity_bits);
+        self.streaming_text_needs_prepare = true;
     }
 
     fn single_session_streaming_visible_range(
@@ -6488,13 +7356,16 @@ impl Canvas {
         app: &SingleSessionApp,
         tick: u64,
     ) -> (u64, bool) {
-        let key = app.rendered_body_cache_key((self.size.width, self.size.height));
+        let body_layout_size = single_session_body_layout_cache_size(app, self.size);
+        let key = app.rendered_body_cache_key(body_layout_size);
         if self.single_session_body_key == Some(key) {
             return (key, false);
         }
 
         if !app.streaming_response.is_empty() {
-            let base_key = app.rendered_body_static_cache_key((self.size.width, self.size.height));
+            self.single_session_raw_body_key = None;
+            self.single_session_raw_body_lines.clear();
+            let base_key = app.rendered_body_static_cache_key(body_layout_size);
             if self.single_session_streaming_base_key != Some(base_key) {
                 if let Some(base_lines) =
                     single_session_rendered_static_body_lines_for_streaming(app, self.size, tick)
@@ -6526,8 +7397,16 @@ impl Canvas {
                 &mut self.single_session_body_lines,
             );
         } else {
-            self.single_session_body_lines =
-                single_session_rendered_body_lines_for_tick(app, self.size, tick);
+            let raw_key = app.rendered_body_cache_key((0, 0));
+            if self.single_session_raw_body_key != Some(raw_key) {
+                self.single_session_raw_body_lines = app.body_styled_lines_for_tick(tick);
+                self.single_session_raw_body_key = Some(raw_key);
+            }
+            self.single_session_body_lines = single_session_rendered_body_lines_from_raw_ref(
+                app,
+                self.size,
+                &self.single_session_raw_body_lines,
+            );
             self.single_session_streaming_base_key = None;
             self.single_session_streaming_base_len = 0;
             self.single_session_body_text_window_start = None;
@@ -6663,6 +7542,8 @@ impl Canvas {
             self.single_session_text_buffers.clear();
             self.single_session_streaming_text_key = None;
             self.single_session_streaming_text_start_line = None;
+            self.single_session_streaming_text_end_line = None;
+            self.single_session_streaming_text_opacity_bits = None;
             self.single_session_streaming_text_buffer = None;
             self.streaming_text_needs_prepare = false;
             self.single_session_body_text_scroll_start = None;
@@ -6686,6 +7567,8 @@ impl Canvas {
             self.single_session_text_buffers.clear();
             self.single_session_streaming_text_key = None;
             self.single_session_streaming_text_start_line = None;
+            self.single_session_streaming_text_end_line = None;
+            self.single_session_streaming_text_opacity_bits = None;
             self.single_session_streaming_text_buffer = None;
             self.streaming_text_needs_prepare = false;
             self.single_session_body_text_scroll_start = None;
@@ -6702,9 +7585,16 @@ impl Canvas {
         frame_profile.checkpoint("text_renderer");
         self.ensure_render_pipeline();
         frame_profile.checkpoint("primitive_pipeline");
-        let (streaming_text_opacity, streaming_text_fade_active) =
-            self.single_session_streaming_fade_opacity(now);
-        if streaming_text_fade_active && self.single_session_streaming_text_buffer.is_some() {
+        let streaming_text_arrival_style = self.single_session_streaming_arrival_style(now);
+        if let DesktopApp::SingleSession(single_session) = app {
+            self.update_single_session_streaming_text_buffer_opacity(
+                single_session,
+                streaming_text_arrival_style.opacity,
+            );
+        }
+        if streaming_text_arrival_style.active
+            && self.single_session_streaming_text_buffer.is_some()
+        {
             self.streaming_text_needs_prepare = true;
         }
         let has_streaming_text_buffer = self.single_session_streaming_text_buffer.is_some();
@@ -6817,7 +7707,8 @@ impl Canvas {
                     self.size,
                     viewport,
                     start_line,
-                    streaming_text_opacity,
+                    streaming_text_arrival_style.opacity,
+                    streaming_text_arrival_style.y_offset_pixels,
                 )]
             } else {
                 Vec::new()
@@ -6875,7 +7766,7 @@ impl Canvas {
                 let animation_active = self.focus_pulse.is_animating()
                     || single_session.has_background_work()
                     || welcome_hero_reveal_active
-                    || streaming_text_fade_active;
+                    || streaming_text_arrival_style.active;
                 let geometry_cache_key = single_session_streaming_primitive_geometry_cache_key(
                     single_session,
                     self.size,

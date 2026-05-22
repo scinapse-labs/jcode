@@ -127,7 +127,7 @@ fn test_mouse_horizontal_scroll_over_tool_side_panel_pans_without_focus_change()
         !scroll_only,
         "side-panel horizontal pan should request an immediate redraw"
     );
-    assert_eq!(app.diff_pane_scroll_x, 3);
+    assert_eq!(app.diff_pane_scroll_x, 1);
     assert!(!app.diff_pane_focus);
 }
 
@@ -302,7 +302,7 @@ fn test_mouse_scroll_help_overlay_updates_help_scroll() {
         scroll_only,
         "help overlay mouse wheel should be scroll-only"
     );
-    assert_eq!(app.help_scroll, Some(6));
+    assert_eq!(app.help_scroll, Some(8));
 
     let scroll_only = app.handle_mouse_event(MouseEvent {
         kind: MouseEventKind::ScrollUp,
@@ -331,7 +331,7 @@ fn test_mouse_scroll_changelog_overlay_updates_changelog_scroll() {
         scroll_only,
         "changelog overlay mouse wheel should be scroll-only"
     );
-    assert_eq!(app.changelog_scroll, Some(1));
+    assert_eq!(app.changelog_scroll, Some(0));
 
     let scroll_only = app.handle_mouse_event(MouseEvent {
         kind: MouseEventKind::ScrollDown,
@@ -341,13 +341,13 @@ fn test_mouse_scroll_changelog_overlay_updates_changelog_scroll() {
     });
 
     assert!(scroll_only);
-    assert_eq!(app.changelog_scroll, Some(2));
+    assert_eq!(app.changelog_scroll, Some(3));
 }
 
 #[test]
-fn test_mouse_scroll_over_unfocused_diagram_does_not_resize_pane() {
+fn test_mouse_scroll_over_unfocused_diagram_scrolls_chat_without_resizing_pane() {
     let _render_lock = scroll_render_test_lock();
-    let mut app = create_test_app();
+    let (mut app, mut terminal) = create_scroll_test_app(120, 30, 0, 80);
     app.diagram_mode = crate::config::DiagramDisplayMode::Pinned;
     app.diagram_pane_enabled = true;
     app.diagram_pane_position = crate::config::DiagramPanePosition::Side;
@@ -359,6 +359,9 @@ fn test_mouse_scroll_over_unfocused_diagram_does_not_resize_pane() {
 
     crate::tui::mermaid::clear_active_diagrams();
     crate::tui::mermaid::register_active_diagram(0x444, 900, 450, None);
+    let _ = render_and_snap(&app, &mut terminal);
+    let max_scroll = crate::tui::ui::last_max_scroll();
+    assert!(max_scroll > 2, "expected scrollable chat content");
     crate::tui::ui::record_layout_snapshot(
         Rect::new(0, 0, 80, 30),
         Some(Rect::new(80, 0, 40, 30)),
@@ -366,6 +369,61 @@ fn test_mouse_scroll_over_unfocused_diagram_does_not_resize_pane() {
         None,
     );
 
+    for (column, row) in [(80, 0), (90, 10), (119, 29)] {
+        app.auto_scroll_paused = false;
+        app.scroll_offset = 0;
+        app.mouse_scroll_queue = 0;
+        app.mouse_scroll_target = None;
+        app.diagram_focus = false;
+
+        let scroll_only = app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert!(
+            !scroll_only,
+            "unfocused diagram wheel at ({column},{row}) should request chat redraw"
+        );
+        assert!(
+            app.auto_scroll_paused,
+            "unfocused diagram wheel at ({column},{row}) should pause chat auto-scroll"
+        );
+        assert_ne!(
+            app.scroll_offset, 0,
+            "unfocused diagram wheel at ({column},{row}) should move chat scroll offset"
+        );
+        assert_eq!(app.diagram_pane_ratio, 40);
+        assert_eq!(app.diagram_pane_ratio_from, 40);
+        assert_eq!(app.diagram_pane_ratio_target, 40);
+        assert!(app.diagram_pane_anim_start.is_none());
+    }
+
+    crate::tui::mermaid::clear_active_diagrams();
+}
+
+#[test]
+fn test_mouse_scroll_over_focused_diagram_can_noop_at_top() {
+    let _render_lock = scroll_render_test_lock();
+    let mut app = create_test_app();
+    app.diagram_mode = crate::config::DiagramDisplayMode::Pinned;
+    app.diagram_pane_enabled = true;
+    app.diagram_pane_position = crate::config::DiagramPanePosition::Side;
+    app.diagram_focus = true;
+    app.diagram_scroll_y = 0;
+
+    crate::tui::mermaid::clear_active_diagrams();
+    crate::tui::mermaid::register_active_diagram(0x446, 900, 450, None);
+    crate::tui::ui::record_layout_snapshot(
+        Rect::new(0, 0, 80, 30),
+        Some(Rect::new(80, 0, 40, 30)),
+        None,
+        None,
+    );
+
+    let before = app.diagram_scroll_y;
     let scroll_only = app.handle_mouse_event(MouseEvent {
         kind: MouseEventKind::ScrollUp,
         column: 90,
@@ -373,11 +431,14 @@ fn test_mouse_scroll_over_unfocused_diagram_does_not_resize_pane() {
         modifiers: KeyModifiers::empty(),
     });
 
-    assert!(scroll_only);
-    assert_eq!(app.diagram_pane_ratio, 40);
-    assert_eq!(app.diagram_pane_ratio_from, 40);
-    assert_eq!(app.diagram_pane_ratio_target, 40);
-    assert!(app.diagram_pane_anim_start.is_none());
+    assert!(
+        scroll_only,
+        "focused diagram still owns plain wheel events over the diagram"
+    );
+    assert_eq!(
+        app.diagram_scroll_y, before,
+        "this test documents the remaining user-visible no-op case for trace diagnostics"
+    );
 
     crate::tui::mermaid::clear_active_diagrams();
 }
@@ -484,6 +545,205 @@ fn test_refresh_model_list_command_suggestions() {
 }
 
 #[test]
+fn test_command_suggestion_arrow_and_ctrl_navigation_accepts_highlighted_row() {
+    let mut app = create_test_app();
+    app.input = "/con".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    assert!(suggestions.len() >= 2);
+
+    app.handle_key(KeyCode::Down, KeyModifiers::empty())
+        .unwrap();
+    assert_eq!(app.command_suggestion_selected, 1);
+    app.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL)
+        .unwrap();
+    assert_eq!(app.command_suggestion_selected, 0);
+    app.handle_key(KeyCode::Char('j'), KeyModifiers::CONTROL)
+        .unwrap();
+    assert_eq!(app.command_suggestion_selected, 1);
+
+    let expected = suggestions[1].0.clone();
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+    assert_eq!(app.input, expected);
+    assert_eq!(app.cursor_pos, app.input.len());
+}
+
+#[test]
+fn test_command_suggestion_navigation_moves_through_all_rows_and_allows_shift_arrow_noise() {
+    let mut app = create_test_app();
+    app.input = "/".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestion_count = app.command_suggestions().len();
+    assert!(suggestion_count > crate::tui::app::COMMAND_SUGGESTION_VISIBLE_LIMIT);
+
+    for expected in 1..=crate::tui::app::COMMAND_SUGGESTION_VISIBLE_LIMIT {
+        app.handle_key(KeyCode::Down, KeyModifiers::empty())
+            .unwrap();
+        assert_eq!(app.command_suggestion_selected, expected);
+    }
+
+    app.handle_key(KeyCode::Down, KeyModifiers::SHIFT).unwrap();
+    assert_eq!(
+        app.command_suggestion_selected,
+        crate::tui::app::COMMAND_SUGGESTION_VISIBLE_LIMIT + 1
+    );
+    app.handle_key(KeyCode::Up, KeyModifiers::SHIFT).unwrap();
+    assert_eq!(
+        app.command_suggestion_selected,
+        crate::tui::app::COMMAND_SUGGESTION_VISIBLE_LIMIT
+    );
+
+    for _ in 0..suggestion_count {
+        app.handle_key(KeyCode::Down, KeyModifiers::empty())
+            .unwrap();
+    }
+    assert_eq!(
+        app.command_suggestion_selected,
+        crate::tui::app::COMMAND_SUGGESTION_VISIBLE_LIMIT
+    );
+}
+
+fn command_cell_fg(
+    terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+    command: &str,
+) -> Option<ratatui::style::Color> {
+    let buf = terminal.backend().buffer();
+    for y in 0..buf.area.height {
+        let mut line = String::new();
+        for x in 0..buf.area.width {
+            line.push_str(buf[(x, y)].symbol());
+        }
+        if let Some(x) = line.find(command) {
+            return Some(buf[(x as u16, y)].fg);
+        }
+    }
+    None
+}
+
+#[test]
+fn test_command_suggestion_render_highlights_selected_row_by_color() {
+    let _lock = scroll_render_test_lock();
+    let mut app = create_test_app();
+    app.input = "/con".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    assert!(suggestions.len() >= 2);
+    let first = suggestions[0].0.clone();
+    let second = suggestions[1].0.clone();
+
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+        .expect("failed to create test terminal");
+    render_and_snap(&app, &mut terminal);
+    assert_eq!(
+        command_cell_fg(&terminal, &first),
+        Some(crate::tui::color_support::rgb(255, 213, 128))
+    );
+    assert_eq!(
+        command_cell_fg(&terminal, &second),
+        Some(crate::tui::color_support::rgb(128, 203, 196))
+    );
+
+    app.handle_key(KeyCode::Down, KeyModifiers::empty())
+        .unwrap();
+    render_and_snap(&app, &mut terminal);
+    assert_eq!(
+        command_cell_fg(&terminal, &first),
+        Some(crate::tui::color_support::rgb(128, 203, 196))
+    );
+    assert_eq!(
+        command_cell_fg(&terminal, &second),
+        Some(crate::tui::color_support::rgb(255, 213, 128))
+    );
+}
+
+#[test]
+fn test_single_command_suggestion_uses_selected_color_only() {
+    let _lock = scroll_render_test_lock();
+    let mut app = create_test_app();
+    app.input = "/review".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    assert_eq!(suggestions.len(), 1);
+    let command = suggestions[0].0.clone();
+
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+        .expect("failed to create test terminal");
+    render_and_snap(&app, &mut terminal);
+    assert_eq!(
+        command_cell_fg(&terminal, &command),
+        Some(crate::tui::color_support::rgb(255, 213, 128))
+    );
+}
+
+#[test]
+fn test_command_suggestion_render_window_scrolls_with_selection() {
+    let _lock = scroll_render_test_lock();
+    let mut app = create_test_app();
+    app.input = "/".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    let limit = crate::tui::app::COMMAND_SUGGESTION_VISIBLE_LIMIT;
+    assert!(suggestions.len() > limit);
+    let first = suggestions[0].0.clone();
+    let selected_after_scroll = suggestions[limit].0.clone();
+
+    for _ in 0..limit {
+        app.handle_key(KeyCode::Down, KeyModifiers::empty())
+            .unwrap();
+    }
+
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))
+        .expect("failed to create test terminal");
+    let rendered = render_and_snap(&app, &mut terminal);
+    assert!(
+        !rendered.contains(&first),
+        "the first suggestion should scroll out of the visible window:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(&selected_after_scroll),
+        "the newly selected suggestion should be visible:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("↑"),
+        "the scrolled window should indicate suggestions above:\n{rendered}"
+    );
+    assert_eq!(
+        command_cell_fg(&terminal, &selected_after_scroll),
+        Some(crate::tui::color_support::rgb(255, 213, 128))
+    );
+}
+
+#[test]
+fn test_remote_command_suggestion_arrow_and_ctrl_navigation_accepts_highlighted_row() {
+    let mut app = create_test_app();
+    app.input = "/con".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    assert!(suggestions.len() >= 2);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    rt.block_on(app.handle_remote_key(KeyCode::Down, KeyModifiers::empty(), &mut remote))
+        .unwrap();
+    assert_eq!(app.command_suggestion_selected, 1);
+    rt.block_on(app.handle_remote_key(KeyCode::Char('k'), KeyModifiers::CONTROL, &mut remote))
+        .unwrap();
+    assert_eq!(app.command_suggestion_selected, 0);
+    rt.block_on(app.handle_remote_key(KeyCode::Char('j'), KeyModifiers::CONTROL, &mut remote))
+        .unwrap();
+    assert_eq!(app.command_suggestion_selected, 1);
+
+    let expected = suggestions[1].0.clone();
+    rt.block_on(app.handle_remote_key(KeyCode::Enter, KeyModifiers::empty(), &mut remote))
+        .unwrap();
+    assert_eq!(app.input, expected);
+    assert_eq!(app.cursor_pos, app.input.len());
+}
+
+#[test]
 fn test_registered_command_suggestions_include_aliases_and_hide_secret_commands() {
     let app = create_test_app();
     let suggestions = app.get_suggestions_for("/");
@@ -540,6 +800,9 @@ fn test_top_level_command_suggestions_include_catchup_and_back() {
 
     let suggestions = app.get_suggestions_for("/gi");
     assert!(suggestions.iter().any(|(cmd, _)| cmd == "/git"));
+
+    let suggestions = app.get_suggestions_for("/comm");
+    assert!(suggestions.iter().any(|(cmd, _)| cmd == "/commit"));
 
     let suggestions = app.get_suggestions_for("/tran");
     assert!(suggestions.iter().any(|(cmd, _)| cmd == "/transcript"));

@@ -370,6 +370,10 @@ async fn handle_remote_key_internal(
         }
     }
 
+    if app.handle_command_suggestion_key(code, modifiers) {
+        return Ok(());
+    }
+
     if let Some(amount) = app.scroll_keys.scroll_amount(code, modifiers) {
         if amount < 0 {
             app.scroll_up((-amount) as usize);
@@ -1512,7 +1516,7 @@ async fn handle_remote_key_internal(
                     return Ok(());
                 }
 
-                if trimmed == "/resume" || trimmed == "/sessions" {
+                if trimmed == "/resume" || trimmed == "/sessions" || trimmed == "/session" {
                     app.open_session_picker();
                     return Ok(());
                 }
@@ -1658,6 +1662,44 @@ async fn handle_remote_key_internal(
                 }
 
                 if handle_workspace_command(app, remote, trimmed).await? {
+                    return Ok(());
+                }
+
+                if trimmed == "/commit" {
+                    let prompt = app_mod::commands::build_commit_prompt();
+                    if app.is_processing {
+                        app.push_display_message(DisplayMessage::system(
+                            app_mod::commands::commit_launch_notice(true),
+                        ));
+                        match remote.soft_interrupt(prompt.clone(), false).await {
+                            Ok(request_id) => {
+                                app.track_pending_soft_interrupt(request_id, prompt);
+                                app.set_status_notice("Interrupting for /commit...");
+                            }
+                            Err(error) => {
+                                app.push_display_message(DisplayMessage::error(format!(
+                                    "Failed to start /commit: {}",
+                                    error
+                                )));
+                                app.set_status_notice("/commit failed");
+                            }
+                        }
+                    } else {
+                        app.push_display_message(DisplayMessage::system(
+                            app_mod::commands::commit_launch_notice(false),
+                        ));
+                        input_dispatch::begin_remote_send(
+                            app,
+                            remote,
+                            prompt,
+                            Vec::new(),
+                            false,
+                            None,
+                            false,
+                            0,
+                        )
+                        .await?;
+                    }
                     return Ok(());
                 }
 
